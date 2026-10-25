@@ -7,9 +7,11 @@ package api
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -54,6 +56,12 @@ type Options struct {
 	Logger *slog.Logger
 	// CORSOrigins is the exact-origin allow-list. Empty disables CORS.
 	CORSOrigins []string
+	// APIToken, when non-empty, requires "Authorization: Bearer <token>" on
+	// every /v1 route. /healthz stays open, so a liveness probe needs no
+	// credential. Empty keeps the API unauthenticated, exactly as before.
+	// The token must meet config.MinAPITokenLength; Config.Validate enforces
+	// that at startup.
+	APIToken string
 	// Timeout bounds a single request. Defaults to 60s.
 	Timeout time.Duration
 	// NetworkPassphrase is the network /readyz expects the RPC endpoint to
@@ -101,9 +109,15 @@ func New(opts Options) *Server {
 		r.Use(cors(opts.CORSOrigins))
 	}
 
+	// /healthz stays outside the authenticated /v1 subtree on purpose: a
+	// liveness probe should not need a credential to prove the process is up.
 	r.Get("/healthz", s.handleLiveness)
+	r.Get("/openapi.json", s.handleOpenAPI)
 	r.Get("/readyz", s.handleReadiness)
 	r.Route("/v1", func(r chi.Router) {
+		if opts.APIToken != "" {
+			r.Use(requireToken(opts.APIToken))
+		}
 		// Answers reflect live on-chain state, so they must not be replayed
 		// from a shared or intermediary cache.
 		r.Use(noStore)
@@ -149,19 +163,27 @@ func cors(origins []string) func(http.Handler) http.Handler {
 // without binding a port.
 func (s *Server) Handler() http.Handler { return s.router }
 
-// ListenAndServe runs the server until ctx is cancelled, then shuts it down
+// ListenAndServe runs the server until ctx is canceled, then shuts it down
 // gracefully.
 func (s *Server) ListenAndServe(ctx context.Context) error {
+	listener, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return err
+	}
+	return s.Serve(ctx, listener)
+}
+
+// Serve runs the server on listener until ctx is canceled, then shuts it down gracefully.
+func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	srv := &http.Server{
-		Addr:              s.addr,
 		Handler:           s.router,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		s.log.Info("http api listening", "addr", s.addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		s.log.Info("http api listening", "addr", listener.Addr())
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
 		}
@@ -170,13 +192,26 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 	select {
 	case err := <-errCh:
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		s.log.Info("shutting down http api")
-		return srv.Shutdown(shutdownCtx)
+		err := srv.Shutdown(shutdownCtx)
+		_ = listener.Close()
+		return err
 	}
+}
+
+//go:embed openapi.json
+var openAPISpec []byte
+
+func (s *Server) handleOpenAPI(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_, _ = w.Write(openAPISpec)
 }
 
 // nosniff stops a browser from reinterpreting a response as a type it did not
